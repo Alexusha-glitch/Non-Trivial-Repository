@@ -1,0 +1,101 @@
+import os
+import numpy as np
+import joblib
+import xgboost as xgb
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from sklearn.metrics import accuracy_score, classification_report, roc_auc_score, confusion_matrix
+from preprocessEDF import convert_df, parse_seizure_info
+
+BASE_DIR = "siena-scalp-eeg-database-1.0.0"
+PN00_DIR = os.path.join(BASE_DIR, "PN00")
+txt_path = os.path.join(PN00_DIR, "Seizures-list-PN00.txt")
+
+train_indices = [1, 3, 4, 5]
+test_index = 2
+
+train_files = [os.path.join(PN00_DIR, f"PN00-{i}.edf") for i in train_indices]
+test_file = os.path.join(PN00_DIR, f"PN00-{test_index}.edf")
+
+print("Loading pretrained EEG model...")
+EEGModel = joblib.load("ias_xgb_epoch30.joblib")
+
+def extract_features_from_df(df):
+    pooled_features = []
+    for x in df["features"]:
+        x = x.astype(np.float32)
+        pooled = np.concatenate([
+            np.pad(x.mean(1), (0, max(0, 49 - x.shape[0])), 'constant')[:49],
+            np.pad(x.std(1), (0, max(0, 49 - x.shape[0])), 'constant')[:49],
+            np.pad(np.percentile(x, 25, axis=1), (0, max(0, 49 - x.shape[0])), 'constant')[:49],
+            np.pad(np.percentile(x, 75, axis=1), (0, max(0, 49 - x.shape[0])), 'constant')[:49]
+        ])
+        pooled_features.append(pooled)
+    return np.array(pooled_features)
+
+X_all, y_all = [], []
+entries = parse_seizure_info(txt_path)
+
+for edf_path in train_files:
+    print(f"Reading EDF file: {edf_path}")
+    df, _ = convert_df(edf_path, entries)
+    if df is not None and not df.empty:
+        feats = extract_features_from_df(df)
+        X_all.extend(feats)
+        y_all.extend(df["label"].tolist())
+
+X_all = np.array(X_all)
+y_all = LabelEncoder().fit_transform(y_all)
+X_all = StandardScaler().fit_transform(X_all)
+dtrain = xgb.DMatrix(X_all, label=y_all)
+
+EEGModel = xgb.train(
+    params={"objective": "multi:softprob", "num_class": 6},
+    dtrain=dtrain,
+    xgb_model=EEGModel,
+    num_boost_round=30
+)
+print("EEG model retrained on PN00-[1, 3, 4, 5]")
+
+print(f"\nTesting on PN00-{test_index}.edf")
+df_test, _ = convert_df(test_file, entries)
+df_test = df_test[df_test["label"].notnull()]
+
+if len(df_test) < 150:
+    raise ValueError(f"Not enough test segments in PN00-{test_index} to sample 150 preictal windows.")
+
+df_sample = df_test.sample(n=150, random_state=42)
+X_test = extract_features_from_df(df_sample)
+y_true = LabelEncoder().fit_transform(df_sample["label"].tolist())
+
+X_test = StandardScaler().fit_transform(X_test)
+dtest = xgb.DMatrix(X_test)
+y_proba = EEGModel.predict(dtest)
+y_pred = np.argmax(y_proba, axis=1)
+
+accuracy = accuracy_score(y_true, y_pred)
+print(f"\nEEG model accuracy on 150 preictal samples from PN00-{test_index}: {accuracy * 100:.2f}%")
+
+print("\nClassification Report:")
+present_classes = np.unique(y_true)
+target_names = [f"Bin {i}" for i in present_classes]
+print(classification_report(y_true, y_pred, labels=present_classes, target_names=target_names))
+
+present_classes = np.unique(y_true)
+if len(present_classes) < 2:
+    print("Not enough classes in test set to compute AUROC")
+else:
+    y_true_bin = label_binarize(y_true, classes=present_classes)
+    y_proba_trimmed = y_proba[:, present_classes]
+    auc = roc_auc_score(y_true_bin, y_proba_trimmed, average='macro', multi_class='ovr')
+    print(f"\nAUROC (macro-average over classes {present_classes.tolist()}): {auc:.4f}")
+
+cm = confusion_matrix(y_true, y_pred)
+specificities = []
+for i in range(len(cm)):
+    tn = cm.sum() - (cm[i, :].sum() + cm[:, i].sum() - cm[i, i])
+    fp = cm[:, i].sum() - cm[i, i]
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    specificities.append(specificity)
+    print(f"Specificity for class {i}: {specificity:.4f}")
+
+print(f"\nMacro-average Specificity: {np.mean(specificities):.4f}")
